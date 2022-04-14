@@ -1,0 +1,13 @@
+[package]
+name = "teeny-qoi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrayvec = { version = "0.7.2", default-features = false }
+zerocopy = "0.6.1"
+
+[features]
+default = ["std"]
+std = []
+alloc = []
