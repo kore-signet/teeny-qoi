@@ -1,5 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+/*!
+QOI decoder & encoder implementation. Heavily based on [the reference implementation](https://github.com/phoboslab/qoi).
+Feature flags:
+- std: enables stdlib support, disables no_std. on by default.
+- alloc: enables use of Vec methods, using the alloc crate while keeping no_std. disabled by default.
+*/
+
 pub use arrayvec::ArrayVec;
 use core::mem;
 use zerocopy::{AsBytes, BigEndian, FromBytes, U32};
@@ -10,13 +17,13 @@ extern crate alloc;
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 use alloc::Vec;
 
-mod decoder;
-mod encoder;
 mod helpers;
-pub use decoder::*;
-pub use encoder::*;
 pub use helpers::*;
 
+pub mod decoder;
+pub mod encoder;
+
+/// A QOI header, containing width, height, channels (3 = RGB | 4 = RGBA) and colorspace (0 = sRGB + Linear Alpha; 1 = All Linear).
 #[derive(AsBytes, FromBytes, Debug)]
 #[repr(C)]
 pub struct Header {
@@ -27,6 +34,7 @@ pub struct Header {
 }
 
 impl Header {
+    /// Make a header for an sRGB image
     pub fn rgb(width: u32, height: u32) -> Header {
         Header {
             width: width.into(),
@@ -36,6 +44,7 @@ impl Header {
         }
     }
 
+    /// Make a header for an sRGBA image
     pub fn rgba(width: u32, height: u32) -> Header {
         Header {
             width: width.into(),
@@ -46,6 +55,7 @@ impl Header {
     }
 }
 
+/// Binary tags & masks for QOI
 pub mod tags {
     pub const INDEX: u8 = 0x00; /* 00xxxxxx */
     pub const DIFF: u8 = 0x40; /* 01xxxxxx */
@@ -73,32 +83,30 @@ const fn in_luma_range(dr_dg: i8, dr_db: i8, dg: i8) -> bool {
     (dr_dg > -9 && dr_dg < 8) && (dg > -33 && dg < 32) && (dr_db > -9 && dr_db < 8)
 }
 
-#[derive(Debug)]
+/// A QOI Operation chunk
+#[derive(Clone, Copy, Debug)]
 pub enum Chunk {
-    Rgb {
-        r: u8,
-        g: u8,
-        b: u8,
-    },
-    Rgba {
-        r: u8,
-        g: u8,
-        b: u8,
-        a: u8,
-    },
+    /// A new RGB pixel. The alpha is copied from the previous pixel.
+    Rgb { r: u8, g: u8, b: u8 },
+    /// A new RGBA pixel.
+    Rgba { r: u8, g: u8, b: u8, a: u8 },
+    /// An index into a rolling array of previously seen pixels
     Index {
         idx: u8, // bounded into 0..63
     },
+    /// Adds a pixel with a small difference from the previously seen pixel
     Diff {
         dr: i8, // bounded into -2..1
         dg: i8, // bounded into  -2..1
         db: i8, // bounded into -2..1
     },
+    /// Adds a pixel with a larger difference from the previously seen pixel
     Luma {
         dg: i8,    // bounded into -32..31
         dr_dg: i8, // bounded into -8..7
         db_dg: i8, // same as dr_db
     },
+    /// Adds an n-long run of the previous pixel
     Run {
         length: u8, // bounded into 1..62
     },
@@ -106,7 +114,7 @@ pub enum Chunk {
 
 // this macro implements as bytes for Chunk, calling the specified method on the byte slices produced
 macro_rules! impl_chunk_as_bytes {
-    ($self:ident, $out:ident, $out_method:ident) => {
+    ($self:expr, $out:ident, $out_method:ident) => {
         match $self {
             Chunk::Rgb { r, g, b } => $out.$out_method(&[tags::RGB, r, g, b]),
             Chunk::Rgba { r, g, b, a } => $out.$out_method(&[tags::RGBA, r, g, b, a]),
@@ -125,33 +133,37 @@ macro_rules! impl_chunk_as_bytes {
 }
 
 impl Chunk {
-    // returns None on failure
+    /// Writes out current chunk into an arrayvec. returns None on failure
     #[inline(always)]
-    pub fn write_to_arrayvec<const CAP: usize>(self, out: &mut ArrayVec<u8, CAP>) -> Option<()> {
-        impl_chunk_as_bytes!(self, out, try_extend_from_slice).ok()
+    pub fn write_to_arrayvec<const CAP: usize>(&self, out: &mut ArrayVec<u8, CAP>) -> Option<()> {
+        impl_chunk_as_bytes!(*self, out, try_extend_from_slice).ok()
     }
 
+    /// Writes out current chunk into a Vec.
     #[cfg(any(feature = "alloc", feature = "std"))]
     #[inline(always)]
-    pub fn write_to_vec(self, out: &mut Vec<u8>) {
-        impl_chunk_as_bytes!(self, out, extend_from_slice);
+    pub fn write_to_vec(&self, out: &mut Vec<u8>) {
+        impl_chunk_as_bytes!(*self, out, extend_from_slice);
     }
 
+    /// Transforms chunk into a Vec of it's bytes.
     #[cfg(any(feature = "alloc", feature = "std"))]
     #[inline(always)]
-    pub fn to_vec(self) -> Vec<u8> {
+    pub fn to_vec(&self) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(5);
         self.write_to_vec(&mut out);
         out
     }
 
+    /// Writes out the Chunk's bytes into a [std::io::Write]
     #[cfg(feature = "std")]
     #[inline(always)]
-    pub fn write_into(self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        impl_chunk_as_bytes!(self, w, write_all)
+    pub fn write_into(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        impl_chunk_as_bytes!(*self, w, write_all)
     }
 }
 
+/// An sRGBA pixel.
 #[derive(AsBytes, FromBytes, Clone, Copy, PartialEq, Debug)]
 #[repr(C)]
 pub struct RgbaPixel {
@@ -162,6 +174,7 @@ pub struct RgbaPixel {
 }
 
 impl RgbaPixel {
+    /// The QOI pixel hash for Index operations: (r * 3 + g * 5 + b * 7 + a * 11) % 64
     #[inline(always)]
     pub fn index_position(&self) -> u8 {
         use core::num::Wrapping;

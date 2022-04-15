@@ -1,5 +1,8 @@
+//! An encoder that turns RGBA bytes into a QOI file.
+
 use crate::*;
 
+/// A QOI encoder.
 pub struct Encoder {
     previously_seen: [RgbaPixel; 64],
     previous: RgbaPixel,
@@ -10,6 +13,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Builds an encoder from a header.
     pub fn new(header: Header) -> Encoder {
         Encoder {
             previously_seen: [RgbaPixel {
@@ -31,6 +35,7 @@ impl Encoder {
         }
     }
 
+    /// Processes a pixel, emitting one to two chunks.
     pub fn process_pixel(&mut self, pixel: RgbaPixel) -> ArrayVec<Chunk, 2> {
         let mut output = ArrayVec::new_const();
         self.index += 1;
@@ -110,6 +115,7 @@ impl Encoder {
         output
     }
 
+    /// Turns an iterator over RgbaPixels (or things that can be converted into RgbaPixels) into a Vec<u8> of QOI bytes.
     #[cfg(any(feature = "alloc", feature = "std"))]
     pub fn image_to_vec<T, I>(mut self, image: I) -> Vec<u8>
     where
@@ -137,6 +143,7 @@ impl Encoder {
         out
     }
 
+    /// Writes out an iterator over RgbaPixels (or things that can be converted into RgbaPixels) as QOI bytes into a [std::io::Write]
     #[cfg(feature = "std")]
     pub fn write_image<T, I, W>(mut self, image: I, out: &mut W) -> std::io::Result<()>
     where

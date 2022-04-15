@@ -1,6 +1,7 @@
 use crate::RgbaPixel;
 use core::slice::ChunksExact;
 
+/// A small adapter that transforms sRGBA bytes into sRGBA pixels.
 pub struct RgbaBytesAdapater<'a> {
     inner: ChunksExact<'a, u8>,
 }

@@ -1,33 +1,32 @@
+//! QOI Decoder implementation.
+
 use crate::*;
 use zerocopy::FromBytes;
 
-pub trait ChunkStream {
-    type Error;
-
-    fn take_chunk(&mut self) -> Result<Option<Chunk>, Self::Error>;
-}
-
-pub struct SliceDecoder<'a> {
+/// Simple abstraction over a slice to help with reading
+pub struct SliceReader<'a> {
     inner: &'a [u8],
     cursor: usize,
 }
 
-impl<'a> SliceDecoder<'a> {
-    pub fn start(inner: &'a [u8]) -> Option<(Header, SliceDecoder<'a>)> {
+impl<'a> SliceReader<'a> {
+    /// Initializes the reader, returning the QOI Header and a Reader struct if it's a valid QOI file.
+    pub fn start(inner: &'a [u8]) -> Option<(Header, SliceReader<'a>)> {
         if inner[0..4] != tags::QOI_MAGIC {
             return None;
         };
 
         let header = Header::read_from(&inner[4..14])?;
 
-        Some((header, SliceDecoder { cursor: 14, inner }))
+        Some((header, SliceReader { cursor: 14, inner }))
     }
 
-    pub fn peek(&self) -> Option<&u8> {
-        self.inner.get(self.cursor)
+    /// Transforms reader into an image decoder.
+    pub fn into_decoder(self) -> ImageDecoder<SliceReader<'a>> {
+        ImageDecoder::new(self)
     }
-
-    pub fn peek_n<const N: usize>(&self) -> Option<&'a [u8; N]> {
+    
+    fn peek_n<const N: usize>(&self) -> Option<&'a [u8; N]> {
         if self.cursor + N > self.inner.len() {
             return None;
         }
@@ -35,7 +34,7 @@ impl<'a> SliceDecoder<'a> {
         Some(array_ref!(self.inner, self.cursor, N))
     }
 
-    pub fn read_u8(&mut self) -> Option<u8> {
+    fn read_u8(&mut self) -> Option<u8> {
         let old_cur = self.cursor;
         self.cursor += 1;
         if self.cursor > self.inner.len() {
@@ -45,7 +44,7 @@ impl<'a> SliceDecoder<'a> {
         Some(self.inner[old_cur])
     }
 
-    pub fn read_n<const N: usize>(&mut self) -> Option<&'a [u8; N]> {
+    fn read_n<const N: usize>(&mut self) -> Option<&'a [u8; N]> {
         let old_cur = self.cursor;
         self.cursor += N;
         if self.cursor > self.inner.len() {
@@ -56,27 +55,23 @@ impl<'a> SliceDecoder<'a> {
     }
 }
 
-impl<'a> ChunkStream for SliceDecoder<'a> {
-    type Error = ();
+impl<'a> Iterator for SliceReader<'a> {
+    type Item = Chunk;
 
-    fn take_chunk(&mut self) -> Result<Option<Chunk>, Self::Error> {
-        let tag = if let Some(b) = self.read_u8() {
-            b
-        } else {
-            return Ok(None);
-        };
+    fn next(&mut self) -> Option<Chunk> {
+        let tag = self.read_u8()?;
 
         // check if it's one of RGB, RGBA, or 0
         match tag {
             tags::RGB => {
-                let [r, g, b] = *self.read_n::<3>().ok_or(())?;
+                let [r, g, b] = *self.read_n::<3>()?;
 
-                return Ok(Some(Chunk::Rgb { r, g, b }));
+                return Some(Chunk::Rgb { r, g, b });
             }
             tags::RGBA => {
-                let [r, g, b, a] = *self.read_n::<4>().ok_or(())?;
+                let [r, g, b, a] = *self.read_n::<4>()?;
 
-                return Ok(Some(Chunk::Rgba { r, g, b, a }));
+                return Some(Chunk::Rgba { r, g, b, a });
             }
             0 => {
                 if self
@@ -84,14 +79,14 @@ impl<'a> ChunkStream for SliceDecoder<'a> {
                     .filter(|b| b[..] == tags::BYTESTREAM_END[1..])
                     .is_some()
                 {
-                    return Ok(None);
+                    return None;
                 }
             }
             _ => (),
         };
 
         let masked_tag = tag & tags::MASK_2;
-        Ok(Some(match masked_tag {
+        Some(match masked_tag {
             tags::INDEX => Chunk::Index { idx: tag },
             tags::DIFF => Chunk::Diff {
                 dr: ((tag >> 4) & tags::DIFF_MASK) as i8 - 2,
@@ -99,12 +94,7 @@ impl<'a> ChunkStream for SliceDecoder<'a> {
                 db: (tag & tags::DIFF_MASK) as i8 - 2,
             },
             tags::LUMA => {
-                let second_byte = if let Some(b) = self.read_u8() {
-                    b
-                } else {
-                    return Ok(None);
-                };
-
+                let second_byte = self.read_u8()?;
                 Chunk::Luma {
                     dg: (tag & tags::INVERSE_MASK_2) as i8 - 32,
                     dr_dg: ((second_byte >> 4) & tags::LUMA_MASK) as i8 - 8,
@@ -115,17 +105,20 @@ impl<'a> ChunkStream for SliceDecoder<'a> {
                 length: (tag & tags::INVERSE_MASK_2) + 1,
             },
             _ => unreachable!(),
-        }))
+        })
     }
 }
 
-pub struct ImageDecoder<T: ChunkStream> {
+/// A QOI Decoder, built over an Iterator of QOI operation chunks.
+pub struct ImageDecoder<T: Iterator<Item = Chunk>> {
     inner: T,
     previously_seen: [RgbaPixel; 64],
     previous: RgbaPixel,
+    run: u8,
 }
 
-impl<T: ChunkStream> ImageDecoder<T> {
+impl<T: Iterator<Item = Chunk>> ImageDecoder<T> {
+    /// Creates a QOI Decoder over an iterator of QOI operation chunks.
     pub fn new(inner: T) -> ImageDecoder<T> {
         ImageDecoder {
             inner,
@@ -141,58 +134,77 @@ impl<T: ChunkStream> ImageDecoder<T> {
                 b: 0,
                 a: 255,
             },
+            run: 0,
         }
     }
 
-    pub fn emit_pixels(&mut self) -> Result<Option<ArrayVec<RgbaPixel, 62>>, T::Error> {
-        let chunk = if let Some(v) = self.inner.take_chunk()? {
-            v
-        } else {
-            return Ok(None);
-        };
+    /// Turns decoder into an iterator of RGBA bytes.
+    pub fn into_rgba_bytes(self) -> PixelsToRgbaBytes<ImageDecoder<T>> {
+        PixelsToRgbaBytes {
+            inner: self,
+            buf: ArrayVec::new_const(),
+        }
+    }
+}
 
-        let mut out = ArrayVec::new();
+impl<T: Iterator<Item = Chunk>> Iterator for ImageDecoder<T> {
+    type Item = RgbaPixel;
 
-        match chunk {
-            Chunk::Rgb { r, g, b } => out.push(RgbaPixel {
+    fn next(&mut self) -> Option<RgbaPixel> {
+        if self.run > 0 {
+            self.run -= 1;
+            return Some(self.previous);
+        }
+
+        let next_pixel = match self.inner.next()? {
+            Chunk::Rgb { r, g, b } => RgbaPixel {
                 r,
                 g,
                 b,
                 a: self.previous.a,
-            }),
-            Chunk::Rgba { r, g, b, a } => out.push(RgbaPixel { r, g, b, a }),
-            Chunk::Index { idx } => out.push(self.previously_seen[idx as usize]),
-            Chunk::Luma { dg, dr_dg, db_dg } => out.push(RgbaPixel {
+            },
+            Chunk::Rgba { r, g, b, a } => RgbaPixel { r, g, b, a },
+            Chunk::Index { idx } => self.previously_seen[idx as usize],
+            Chunk::Luma { dg, dr_dg, db_dg } => RgbaPixel {
                 r: ((self.previous.r as i16) + (dr_dg as i16 + dg as i16)) as u8,
                 g: (self.previous.g as i16 + dg as i16) as u8,
                 b: ((self.previous.b as i16) + (db_dg as i16 + dg as i16)) as u8,
                 a: self.previous.a,
-            }),
-            Chunk::Diff { dr, dg, db } => {
-                out.push(RgbaPixel {
-                    r: (self.previous.r as i16 + dr as i16) as u8,
-                    g: (self.previous.g as i16 + dg as i16) as u8,
-                    b: (self.previous.b as i16 + db as i16) as u8,
-                    a: self.previous.a,
-                });
-            }
+            },
+            Chunk::Diff { dr, dg, db } => RgbaPixel {
+                r: (self.previous.r as i16 + dr as i16) as u8,
+                g: (self.previous.g as i16 + dg as i16) as u8,
+                b: (self.previous.b as i16 + db as i16) as u8,
+                a: self.previous.a,
+            },
             Chunk::Run { length } => {
-                for i in 0..length {
-                    // i want to avoid doing unsafe here, but to avoid assertions be run everytime, it's kinda needed.
-                    unsafe {
-                        out.as_mut_ptr().add(i as usize).write(self.previous);
-                    }
-                }
-
-                unsafe {
-                    out.set_len(length as usize);
-                }
+                self.run = length - 1;
+                self.previous
             }
         };
 
-        self.previous = out[0];
-        self.previously_seen[self.previous.index_position() as usize] = out[0];
+        self.previous = next_pixel;
+        self.previously_seen[next_pixel.index_position() as usize] = next_pixel;
 
-        Ok(Some(out))
+        Some(next_pixel)
+    }
+}
+
+/// Small adapter to flatten out RgbaPixel's into RGBA bytes.
+pub struct PixelsToRgbaBytes<T: Iterator<Item = RgbaPixel>> {
+    inner: T,
+    buf: ArrayVec<u8, 4>,
+}
+
+impl<T: Iterator<Item = RgbaPixel>> Iterator for PixelsToRgbaBytes<T> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        if self.buf.is_empty() {
+            let next_pixel = self.inner.next()?;
+            self.buf = ArrayVec::from([next_pixel.a, next_pixel.b, next_pixel.g, next_pixel.r]);
+        }
+
+        self.buf.pop()
     }
 }

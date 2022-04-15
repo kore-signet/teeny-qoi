@@ -2,10 +2,18 @@
 name = "teeny-qoi"
 version = "0.1.0"
 edition = "2021"
+description = "An implementation of the Quite Okay Image Format with no_std support"
+repository = "https://github.com/emily-signet/teeny-qoi"
+categories = ["no-std", "multimedia::images"]
+kewords = ["image", "qoi", "no-std"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 arrayvec = { version = "0.7.2", default-features = false }
 zerocopy = "0.6.1"
+
+[dev-dependencies]
+image = "0.24.1"
 
 [features]
 default = ["std"]

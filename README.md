@@ -1,2 +1,2 @@
 # teeny-qoi
-a toy qoi encoder (and hopefully soon decoder) with no-std support
+a tiny quite okay image format encoder and decoder with no-std support
