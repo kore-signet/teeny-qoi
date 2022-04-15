@@ -10,10 +10,14 @@ extern crate alloc;
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 use alloc::Vec;
 
+mod decoder;
+mod encoder;
 mod helpers;
+pub use decoder::*;
+pub use encoder::*;
 pub use helpers::*;
 
-#[derive(AsBytes, FromBytes)]
+#[derive(AsBytes, FromBytes, Debug)]
 #[repr(C)]
 pub struct Header {
     pub width: U32<BigEndian>,
@@ -43,12 +47,17 @@ impl Header {
 }
 
 pub mod tags {
-    pub const INDEX: u8 = 0x00;
-    pub const DIFF: u8 = 0x40;
-    pub const LUMA: u8 = 0x80;
-    pub const RUN: u8 = 0xc0;
-    pub const RGB: u8 = 0xfe;
-    pub const RGBA: u8 = 0xff;
+    pub const INDEX: u8 = 0x00; /* 00xxxxxx */
+    pub const DIFF: u8 = 0x40; /* 01xxxxxx */
+    pub const LUMA: u8 = 0x80; /* 10xxxxxx */
+    pub const RUN: u8 = 0xc0; /* 11xxxxxx */
+    pub const RGB: u8 = 0xfe; /* 11111110 */
+    pub const RGBA: u8 = 0xff; /* 11111111 */
+
+    pub const MASK_2: u8 = 0xc0; /* 11000000 */
+    pub const DIFF_MASK: u8 = 0x03; /* 00000011 */
+    pub const INVERSE_MASK_2: u8 = 0x3f; /* 00111111 */
+    pub const LUMA_MASK: u8 = 0x0f; /* 00001111 */
 
     pub const QOI_MAGIC: [u8; 4] = [b'q', b'o', b'i', b'f'];
     pub const BYTESTREAM_END: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -64,6 +73,7 @@ const fn in_luma_range(dr_dg: i8, dr_db: i8, dg: i8) -> bool {
     (dr_dg > -9 && dr_dg < 8) && (dg > -33 && dg < 32) && (dr_db > -9 && dr_db < 8)
 }
 
+#[derive(Debug)]
 pub enum Chunk {
     Rgb {
         r: u8,
@@ -142,8 +152,8 @@ impl Chunk {
     }
 }
 
+#[derive(AsBytes, FromBytes, Clone, Copy, PartialEq, Debug)]
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
 pub struct RgbaPixel {
     pub r: u8,
     pub g: u8,
@@ -154,7 +164,7 @@ pub struct RgbaPixel {
 impl RgbaPixel {
     #[inline(always)]
     pub fn index_position(&self) -> u8 {
-        use std::num::Wrapping;
+        use core::num::Wrapping;
         let (r, g, b, a) = (
             Wrapping(self.r),
             Wrapping(self.g),
@@ -186,164 +196,5 @@ impl From<(u8, u8, u8, u8)> for RgbaPixel {
 impl From<(u8, u8, u8)> for RgbaPixel {
     fn from((r, g, b): (u8, u8, u8)) -> Self {
         RgbaPixel { r, g, b, a: 255 }
-    }
-}
-
-pub struct Encoder {
-    previously_seen: [RgbaPixel; 64],
-    previous: RgbaPixel,
-    run: u8,
-    index: u32,
-    length: u32,
-    pub header: Header,
-}
-
-impl Encoder {
-    pub fn new(header: Header) -> Encoder {
-        Encoder {
-            previously_seen: [RgbaPixel {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0,
-            }; 64],
-            previous: RgbaPixel {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 255,
-            },
-            run: 0,
-            index: 0,
-            length: header.width.get() * header.height.get(),
-            header,
-        }
-    }
-
-    pub fn process_pixel(&mut self, pixel: RgbaPixel) -> ArrayVec<Chunk, 2> {
-        let mut output = ArrayVec::new_const();
-        self.index += 1;
-
-        // if pixel is the same as the last one, possibly emit a Run operation and return
-        if pixel == self.previous {
-            self.run += 1;
-
-            // if the run is 62, we've reached the maximum len QOI allows
-            // else, if we're at the end of the image, we need to emit a last chunk containing the current run
-            if self.run == 62 || self.index == self.length {
-                output.push(Chunk::Run {
-                    length: mem::take(&mut self.run),
-                });
-            }
-
-            self.previous = pixel;
-
-            return output;
-        }
-
-        // if pixel is different:
-
-        // first, reset the run if one exists
-        if self.run > 0 {
-            output.push(Chunk::Run {
-                length: mem::take(&mut self.run),
-            });
-            self.run = 0;
-        }
-
-        // if pixel is in the previously seen array, return an Index operation and return
-        let index_pos = pixel.index_position();
-        if self.previously_seen[index_pos as usize] == pixel {
-            output.push(Chunk::Index { idx: index_pos });
-            self.previous = pixel;
-            return output;
-        }
-
-        // if it isn't, add it to it!
-        self.previously_seen[index_pos as usize] = pixel;
-
-        // if the alpha channel matches the previous pixel:
-        if pixel.a == self.previous.a {
-            // pixel val diffs
-            let dr: i8 = pixel.r.wrapping_sub(self.previous.r) as i8;
-            let dg: i8 = pixel.g.wrapping_sub(self.previous.g) as i8;
-            let db: i8 = pixel.b.wrapping_sub(self.previous.b) as i8;
-
-            // diffs between the red and blue diffs and the green diff
-            let dr_dg = dr.wrapping_sub(dg) as i8;
-            let db_dg = db.wrapping_sub(dg) as i8;
-
-            output.push(if in_diff_range(dr, dg, db) {
-                Chunk::Diff { dr, dg, db }
-            } else if in_luma_range(dr_dg, db_dg, dg) {
-                Chunk::Luma { dg, dr_dg, db_dg }
-            } else {
-                Chunk::Rgb {
-                    r: pixel.r,
-                    g: pixel.g,
-                    b: pixel.b,
-                }
-            });
-        // if we have a new alpha value:
-        } else {
-            output.push(Chunk::Rgba {
-                r: pixel.r,
-                g: pixel.g,
-                b: pixel.b,
-                a: pixel.a,
-            });
-        }
-
-        self.previous = pixel;
-
-        output
-    }
-
-    #[cfg(any(feature = "alloc", feature = "std"))]
-    pub fn image_to_vec<T, I>(mut self, image: I) -> Vec<u8>
-    where
-        T: Into<RgbaPixel>,
-        I: IntoIterator<Item = T>,
-    {
-        // width * height * channels+1 + header size + bytestream end size
-        let mut out = Vec::with_capacity(
-            (self.header.width.get() * self.header.height.get() * (self.header.channels + 1) as u32
-                + 14
-                + 8) as usize,
-        );
-
-        out.extend_from_slice(&tags::QOI_MAGIC);
-        out.extend_from_slice(self.header.as_bytes());
-
-        for pixel in image {
-            for chunk in self.process_pixel(pixel.into()) {
-                chunk.write_to_vec(&mut out);
-            }
-        }
-
-        out.extend_from_slice(&tags::BYTESTREAM_END);
-
-        out
-    }
-
-    #[cfg(feature = "std")]
-    pub fn write_image<T, I, W>(mut self, image: I, out: &mut W) -> std::io::Result<()>
-    where
-        T: Into<RgbaPixel>,
-        I: IntoIterator<Item = T>,
-        W: std::io::Write,
-    {
-        out.write_all(&tags::QOI_MAGIC)?;
-        out.write_all(self.header.as_bytes())?;
-
-        for pixel in image {
-            for chunk in self.process_pixel(pixel.into()) {
-                chunk.write_into(out)?;
-            }
-        }
-
-        out.write_all(&tags::BYTESTREAM_END)?;
-
-        Ok(())
     }
 }

@@ -24,14 +24,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoi-rs"
-version = "0.1.0"
-dependencies = [
- "arrayvec",
- "zerocopy",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -61,6 +53,14 @@ dependencies = [
  "quote",
  "syn",
  "unicode-xid",
+]
+
+[[package]]
+name = "teeny-qoi"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "zerocopy",
 ]
 
 [[package]]
